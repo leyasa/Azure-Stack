@@ -3,7 +3,7 @@ $collectionScript = {
     $nodename = $using:server
 
     Write-Host -ForegroundColor White "******************************************************************************************************"
-    Write-Host -ForegroundColor White "                             Starting log collection on" $node "(" $nodename ")"
+    Write-Host -ForegroundColor White "                             Starting log collection on" $node "(" $($nodename.name) ")"
     Write-Host -ForegroundColor White "******************************************************************************************************"
     
     $DataCollectionDir = "c:\temp\CSS_AppServiceLogs"   
@@ -87,8 +87,8 @@ $collectionScript = {
     Write-host "Collect C:\Packages completed on" $node -ForegroundColor Yellow       
 
     write-host "Compressing Files" -ForegroundColor Green    
-    Compress-Archive -Path $DataCollectionDir\*  -DestinationPath $DataCollectionDir\$nodename.$env:computername.zip -Force 
-    Get-ChildItem -Path $DataCollectionDir\ -Recurse | Where-Object {$_.Name -notlike "*$nodename.*"} | Remove-Item -Recurse -Force -Confirm:$false   
+    Compress-Archive -Path $DataCollectionDir\*  -DestinationPath $DataCollectionDir\$($nodename.name).$env:computername.zip -Force 
+    Get-ChildItem -Path $DataCollectionDir\ -Recurse | Where-Object {$_.Name -notlike "*$($nodename.name).*"} | Remove-Item -Recurse -Force -Confirm:$false   
 }
 
 $cleanupScript = { 
@@ -111,31 +111,49 @@ if (test-path -Path $logDirectory -PathType Any){
         Remove-Item -Path $logDirectory -Recurse -Force -Confirm:$false | Out-Null
     } 
 New-Item -path $logDirectory -ItemType Directory -Force | out-null
-
+[String]$CurrentDate=($((get-date).GetDateTimeFormats()[105])).replace(":","")
 $workerCred = Get-Credential -Message "Enter credentials for Worker Admin"
 
 Get-AppServiceServer | select Name, Status, Role, CpuPercentage, MemoryPercentage, ServerState, PlatformVersion | ft > $logDirectory"\Get-AppServiceServer.txt"
 Get-AppServiceServer | ConvertTo-Json | Out-File $logDirectory"\AppServiceServer.json"
 Get-AppServiceEvent | ConvertTo-Json | Out-File $logDirectory"\AppServiceEvent.json"
 
-$roleServers = Get-AppServiceServer | Select -ExpandProperty Name
+$roleServers = Get-AppServiceServer
 
 foreach ($server in $roleServers) {
 
-    $serverRole = Get-AppServiceServer | Where-Object {$_.Name -eq $server} | Select -ExpandProperty Role
-
-    if($serverRole -eq "WebWorker")
+    if($server.role -eq "WebWorker")
     {
-	    $workerSession = New-PSSession -Credential $workerCred -ComputerName $server
-	    Invoke-Command -Session $workerSession -ScriptBlock $collectionScript 
-	    Copy-Item -FromSession $workerSession -Path c:\temp\CSS_AppServiceLogs\*.zip -Destination $logDirectory -Verbose
-	    Invoke-Command -Session $workerSession -ScriptBlock $cleanupScript
-	    Remove-PSSession $workerSession
+	    Invoke-Command -ComputerName $($server.name) -ScriptBlock $collectionScript -Credential $workerCred -AsJob -JobName $CurrentDate-$($server.name) |out-null
     }
     else
     {
-        Invoke-Command -ComputerName $server -ScriptBlock $collectionScript
-        Copy-Item \\$server\CSS\* -Destination $logDirectory -Verbose    
-        Invoke-Command -ComputerName $server -ScriptBlock $cleanupScript
+        Invoke-Command -ComputerName $($server.name) -ScriptBlock $collectionScript -AsJob -JobName $CurrentDate-$($server.name)|out-null
+    }
+    write-host "Starting data collection on $($server.role) $($server.name)"
+}
+
+do{
+    $AllJobs=get-job -Name $CurrentDate*
+    $JobsCompleted=$AllJobs | ? state -like Completed
+    write-host "$((get-date).GetDateTimeFormats()[94]) - Sleeping for 15 seconds until data collection job completion - ($($JobsCompleted.count) of $($AllJobs.count))"
+    Start-Sleep -Seconds 15
+}
+Until($($JobsCompleted.count) -eq $($AllJobs.count))
+
+foreach ($server in $roleServers) {
+
+    if($Server.Role -eq "WebWorker")
+    {
+	    $workerSession = New-PSSession -Credential $workerCred -ComputerName $($server.name)
+	    Copy-Item -FromSession $workerSession -Path c:\temp\CSS_AppServiceLogs\*.zip -Destination $logDirectory -Verbose
+        Invoke-Command -Session $workerSession -ScriptBlock $cleanupScript
+        Remove-PSSession $workerSession
+    }
+    else
+    {
+        Copy-Item \\$($server.name)\CSS\* -Destination $logDirectory -Verbose    
+        Invoke-Command -ComputerName $($server.name) -ScriptBlock $cleanupScript
     }
 }
+remove-job $AllJobs
